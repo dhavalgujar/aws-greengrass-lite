@@ -2,6 +2,10 @@
 // Copyright Amazon.com, Inc. or its affiliates. All Rights Reserved.
 // SPDX-License-Identifier: Apache-2.0
 
+// The systemd-free portable core uses health_portable.c and
+// subscriptions_portable.c instead.
+#ifndef GGL_PORTABLE_CORE
+
 #include "subscriptions.h"
 #include "sd_bus.h"
 #include <assert.h>
@@ -496,3 +500,5 @@ void gghealthd_unregister_all_component_state_changes_subscription(
         );
     }
 }
+
+#endif

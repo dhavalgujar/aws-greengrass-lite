@@ -2,6 +2,10 @@
 // Copyright Amazon.com, Inc. or its affiliates. All Rights Reserved.
 // SPDX-License-Identifier: Apache-2.0
 
+// The systemd-free portable core uses health_portable.c and
+// subscriptions_portable.c instead.
+#ifndef GGL_PORTABLE_CORE
+
 #include "health.h"
 #include "bus_client.h"
 #include "sd_bus.h"
@@ -278,3 +282,5 @@ GgError gghealthd_init(void) {
     init_health_events();
     return GG_ERR_OK;
 }
+
+#endif

@@ -1,0 +1,15 @@
+[Unit]
+Description=Greengrass IPC daemon
+StartLimitInterval=20
+StartLimitBurst=10
+After=ggl.core.ggconfigd.service ggl.core.ggpubsubd.service
+
+[Service]
+Type=exec
+User=ggcore
+Group=ggcore
+ExecStart=/usr/bin/ggipcd -s /var/lib/greengrass/gg-ipc.socket
+WorkingDirectory=/var/lib/greengrass
+Restart=always
+RestartSec=1
+X-GGL-ReadySocket=/var/lib/greengrass/gg-ipc.socket

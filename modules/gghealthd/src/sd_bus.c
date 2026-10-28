@@ -2,6 +2,10 @@
 // Copyright Amazon.com, Inc. or its affiliates. All Rights Reserved.
 // SPDX-License-Identifier: Apache-2.0
 
+// The systemd-free portable core uses health_portable.c and
+// subscriptions_portable.c instead.
+#ifndef GGL_PORTABLE_CORE
+
 #include "sd_bus.h"
 #include <assert.h>
 #include <errno.h>
@@ -416,3 +420,5 @@ GgError restart_component(sd_bus *bus, const char *qualified_name) {
     }
     return GG_ERR_OK;
 }
+
+#endif

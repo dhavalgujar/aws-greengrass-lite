@@ -1,0 +1,14 @@
+[Unit]
+Description=core-bus config interface daemon
+StartLimitInterval=20
+StartLimitBurst=10
+
+[Service]
+Type=exec
+User=ggcore
+Group=ggcore
+ExecStart=/usr/bin/ggconfigd
+WorkingDirectory=/var/lib/greengrass
+Restart=always
+RestartSec=1
+X-GGL-ReadySocket=/run/greengrass/gg_config

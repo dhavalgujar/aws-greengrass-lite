@@ -1,0 +1,15 @@
+[Unit]
+Description=AWS IoT Core MQTT daemon
+StartLimitInterval=20
+StartLimitBurst=10
+After=ggl.core.ggconfigd.service
+
+[Service]
+Type=exec
+User=ggcore
+Group=ggcore
+ExecStart=/usr/bin/iotcored
+WorkingDirectory=/var/lib/greengrass
+Restart=always
+RestartSec=1
+X-GGL-ReadySocket=/run/greengrass/aws_iot_mqtt

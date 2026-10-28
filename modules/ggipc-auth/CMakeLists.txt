@@ -2,7 +2,11 @@
 # Copyright Amazon.com, Inc. or its affiliates. All Rights Reserved.
 # SPDX-License-Identifier: Apache-2.0
 
-ggl_init_module(
-  ggipc-auth
-  NO_INLINE_TEST
-  LIBS gg-sdk PkgConfig::libsystemd)
+if(GGL_PORTABLE_CORE)
+  ggl_init_module(ggipc-auth NO_INLINE_TEST LIBS gg-sdk ggl-svc)
+else()
+  ggl_init_module(
+    ggipc-auth
+    NO_INLINE_TEST
+    LIBS gg-sdk PkgConfig::libsystemd)
+endif()

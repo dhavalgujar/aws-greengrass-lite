@@ -1,0 +1,17 @@
+[Unit]
+Description=Greengrass component health daemon
+StartLimitInterval=20
+StartLimitBurst=10
+After=ggl.core.ggconfigd.service
+
+[Service]
+Type=exec
+# As ggdeploymentd: root, but its core-bus socket must be reachable by the
+# ggcore daemons (gg-fleet-statusd, ggipcd).
+User=root
+Group=ggcore
+ExecStart=/usr/bin/gghealthd
+WorkingDirectory=/var/lib/greengrass
+Restart=always
+RestartSec=1
+X-GGL-ReadySocket=/run/greengrass/gg_health

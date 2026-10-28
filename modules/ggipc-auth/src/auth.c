@@ -10,9 +10,25 @@
 #include <ggipc/auth.h>
 #include <string.h>
 #include <sys/types.h>
+#ifdef GGL_PORTABLE_CORE
+#include <ggl/svc.h>
+#include <stdio.h>
+#else
 #include <systemd/sd-login.h>
+#endif
 
 GgError ggl_ipc_auth_validate_name(pid_t pid, GgBuffer component_name) {
+#ifdef GGL_PORTABLE_CORE
+    // Without systemd, ggl-svcd knows which unit a process belongs to: the
+    // unit whose main process is the peer or one of its ancestors.
+    char request[32];
+    char unit_name[256];
+    (void) snprintf(request, sizeof(request), "whois %ld", (long) pid);
+    if (ggl_svc_call(request, unit_name, sizeof(unit_name)) != 0) {
+        GG_LOGE("Failed to look up service for pid %d.", pid);
+        return GG_ERR_FAILURE;
+    }
+#else
     char *unit_name = NULL;
     int error = sd_pid_get_unit(pid, &unit_name);
     GG_CLEANUP(cleanup_free, unit_name);
@@ -20,6 +36,7 @@ GgError ggl_ipc_auth_validate_name(pid_t pid, GgBuffer component_name) {
         GG_LOGE("Failed to look up service for pid %d.", pid);
         return GG_ERR_FAILURE;
     }
+#endif
 
     GgBuffer name = gg_buffer_from_null_term(unit_name);
 
