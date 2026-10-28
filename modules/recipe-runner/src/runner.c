@@ -35,6 +35,7 @@
 #include <unistd.h>
 #include <stdbool.h>
 #include <stdint.h>
+#include <stdio.h>
 #include <stdlib.h>
 
 static GgError write_escaped_char(int out_fd, uint8_t c, bool single_quote) {
@@ -847,8 +848,23 @@ GgError runner(const RecipeRunnerArgs *args) {
         phase
     );
 
+#ifdef GGL_PORTABLE_CORE
+    // Some constrained images have procfs but omit the /dev/fd symlinks that
+    // musl's fexecve fallback expects for an interpreted memfd script.
+    char script_path[64];
+    int path_len = snprintf(
+        script_path, sizeof(script_path), "/proc/self/fd/%d", script_fd
+    );
+    if ((path_len < 0) || ((size_t) path_len >= sizeof(script_path))) {
+        GG_LOGE("Failed to construct component script path.");
+        return GG_ERR_FATAL;
+    }
+    const char *argv[] = { "/bin/sh", script_path, NULL };
+    sys_ret = execve("/bin/sh", (char **) argv, environ);
+#else
     const char *argv[] = { "/bin/sh", NULL };
     sys_ret = fexecve(script_fd, (char **) argv, environ);
+#endif
 
     GG_LOGE("Failed to execute component phase script: %d.", errno);
     return GG_ERR_FATAL;

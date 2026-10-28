@@ -14,6 +14,9 @@ option(BUILD_EXAMPLES "Build examples")
 
 option(ENABLE_WERROR "Compile warnings as errors")
 
+option(GGL_PORTABLE_CORE
+       "Build for a system without systemd, managed by ggl-svcd" OFF)
+
 set(GG_LOG_LEVEL CACHE STRING "GG log level")
 # Backwards compat
 if(GGL_LOG_LEVEL AND NOT GG_LOG_LEVEL)
@@ -24,6 +27,12 @@ endif()
 
 option(GGL_SYSTEMD_SERVICE_BUILD "Install GGL as a set of systemd services"
        TRUE)
+if(GGL_PORTABLE_CORE)
+  set(GGL_SYSTEMD_SERVICE_BUILD
+      OFF
+      CACHE BOOL "Install GGL as a set of systemd services" FORCE)
+  add_compile_definitions(GGL_PORTABLE_CORE)
+endif()
 set(GGL_SYSTEMD_SYSTEM_DIR
     "lib/systemd/system"
     CACHE STRING "Install directory for systemd unit files")
@@ -270,11 +279,13 @@ pkg_search_module(openssl REQUIRED IMPORTED_TARGET openssl)
 pkg_search_module(libcurl REQUIRED IMPORTED_TARGET libcurl>=7.68)
 pkg_search_module(sqlite3 REQUIRED IMPORTED_TARGET sqlite3)
 pkg_search_module(yaml REQUIRED IMPORTED_TARGET yaml-0.1)
-pkg_search_module(libsystemd REQUIRED IMPORTED_TARGET libsystemd)
 pkg_search_module(uuid REQUIRED IMPORTED_TARGET uuid)
 pkg_search_module(libevent REQUIRED IMPORTED_TARGET libevent)
 pkg_search_module(liburiparser REQUIRED IMPORTED_TARGET liburiparser)
 pkg_search_module(libzip REQUIRED IMPORTED_TARGET libzip)
+if(NOT GGL_PORTABLE_CORE)
+  pkg_search_module(libsystemd REQUIRED IMPORTED_TARGET libsystemd)
+endif()
 
 include(CheckCSourceCompiles)
 
@@ -284,6 +295,18 @@ check_c_source_compiles(
   int main(void) { argp_parse(0, 0, 0, 0, 0, 0); }
   "
   has_argp)
+
+if(NOT has_argp)
+  find_path(argp_INCLUDE_DIR NAMES argp.h REQUIRED)
+  find_library(argp_LIBRARY NAMES argp REQUIRED)
+  add_library(argp STATIC IMPORTED GLOBAL)
+  set_target_properties(
+    argp PROPERTIES IMPORTED_LOCATION "${argp_LIBRARY}"
+                    INTERFACE_INCLUDE_DIRECTORIES "${argp_INCLUDE_DIR}")
+  # ggl-common itself includes argp.h, while the argp target is attached to
+  # each final executable by ggl_init_module below.
+  include_directories(SYSTEM "${argp_INCLUDE_DIR}")
+endif()
 
 #
 # Add components
