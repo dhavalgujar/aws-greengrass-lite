@@ -47,6 +47,8 @@ static const GgBuffer ARCHITECTURE =
     GG_STR("arm");
 #elif defined(__riscv) && (__riscv_xlen == 64)
     GG_STR("riscv64");
+#elif defined(__riscv) && (__riscv_xlen == 32)
+    GG_STR("riscv32");
 #else
 #error "Unknown target architecture"
     { 0 };
