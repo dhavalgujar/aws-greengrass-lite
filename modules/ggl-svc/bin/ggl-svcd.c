@@ -68,8 +68,13 @@
 #ifndef GGL_SVC_CORE_DIR
 #define GGL_SVC_CORE_DIR "/usr/lib/ggl-svc"
 #endif
+// Overridable for tests.
+#ifndef STATE_DIR
 #define STATE_DIR "/var/lib/ggl-svc"
+#endif
+#ifndef CGROUP_ROOT
 #define CGROUP_ROOT "/sys/fs/cgroup"
+#endif
 #define CGROUP_DIR CGROUP_ROOT "/ggl-svc"
 #define CGROUP2_MAGIC 0x63677270
 #define LOG_LINE_MAX 480
@@ -255,6 +260,11 @@ static bool write_file(const char *path, const char *data) {
 // Signals every process in the unit's cgroup; returns how many there were.
 // SIGKILL uses cgroup.kill, which also catches processes forking meanwhile.
 static int signal_cgroup(const Unit *u, int sig) {
+    // A main process that was just forked may not have joined the cgroup
+    // yet (exec_unit does so first): signal it directly as well.
+    if ((u->pid > 0) && (sig != 0)) {
+        (void) kill(u->pid, sig);
+    }
     char path[NAME_LEN + 64];
     if (sig == SIGKILL) {
         cgroup_path(u, "cgroup.kill", path, sizeof(path));
@@ -579,7 +589,9 @@ static bool is_enabled(const Unit *u) {
         return true;
     }
     char path[PATH_LEN + NAME_LEN];
-    (void) snprintf(path, sizeof(path), STATE_DIR "/enabled/%s", u->name);
+    (void) snprintf(
+        path, sizeof(path), STATE_DIR "/enabled/%.*s", NAME_LEN - 1, u->name
+    );
     return access(path, F_OK) == 0;
 }
 
@@ -685,6 +697,19 @@ static void prune_copies(void) {
 
 // Process management //
 
+static bool real_home(const char *dir) {
+    return (dir != NULL) && (dir[0] == '/') && (strcmp(dir, "/") != 0)
+        && (strcmp(dir, "/nonexistent") != 0);
+}
+
+static bool login_shell(const char *shell) {
+    if ((shell == NULL) || (shell[0] != '/')) {
+        return false;
+    }
+    const char *base = strrchr(shell, '/') + 1;
+    return (strcmp(base, "nologin") != 0) && (strcmp(base, "false") != 0);
+}
+
 static void build_env(
     const Unit *u, char **envp, char storage[][320], int max
 ) {
@@ -697,17 +722,34 @@ static void build_env(
     );
     envp[n] = storage[n];
     n++;
-    struct passwd *pw = (u->user[0] != '\0') ? getpwnam(u->user) : getpwuid(0);
-    if (pw != NULL) {
-        (void) snprintf(storage[n], 320, "HOME=%s", pw->pw_dir);
-        envp[n] = storage[n];
-        n++;
+    // As systemd: USER always; LOGNAME, HOME and SHELL only for units with
+    // User=, and neither a home directory that is no real one nor a shell
+    // that refuses logins.
+    struct passwd *pw = (u->user[0] != '\0') ? getpwnam(u->user) : NULL;
+    if (pw == NULL) {
+        struct passwd *self = getpwuid(geteuid());
+        if (self != NULL) {
+            (void) snprintf(storage[n], 320, "USER=%s", self->pw_name);
+            envp[n] = storage[n];
+            n++;
+        }
+    } else {
         (void) snprintf(storage[n], 320, "USER=%s", pw->pw_name);
         envp[n] = storage[n];
         n++;
         (void) snprintf(storage[n], 320, "LOGNAME=%s", pw->pw_name);
         envp[n] = storage[n];
         n++;
+        if (real_home(pw->pw_dir)) {
+            (void) snprintf(storage[n], 320, "HOME=%s", pw->pw_dir);
+            envp[n] = storage[n];
+            n++;
+        }
+        if (login_shell(pw->pw_shell)) {
+            (void) snprintf(storage[n], 320, "SHELL=%s", pw->pw_shell);
+            envp[n] = storage[n];
+            n++;
+        }
     }
     for (int i = 0; (i < u->n_env) && (n < max - 1); i++) {
         (void) snprintf(storage[n], 320, "%s", u->env[i]);
@@ -717,8 +759,12 @@ static void build_env(
     envp[n] = NULL;
 }
 
-// Runs in the child; never returns.
+// Runs in the child, with SIGTERM and SIGINT blocked; never returns.
 static void exec_unit(const Unit *u, int log_fd) {
+    // ggl-svcd's own handlers must not catch a stop meant for the unit:
+    // restore the defaults before anything can unblock them.
+    (void) signal(SIGTERM, SIG_DFL);
+    (void) signal(SIGINT, SIG_DFL);
     // Join the unit's cgroup before anything else runs (exit status 219 is
     // systemd's EXIT_CGROUP).
     char procs[NAME_LEN + 64];
@@ -865,7 +911,11 @@ static void spawn(Unit *u) {
         return;
     }
     if (!start_allowed(u)) {
-        set_result(u, "start-limit-hit");
+        // As systemd: the start limit only replaces a successful result; a
+        // restart refused after a failure keeps that failure's result.
+        if (strcmp(u->result, "success") == 0) {
+            set_result(u, "start-limit-hit");
+        }
         set_state(u, S_FAILED);
         return;
     }
@@ -896,7 +946,18 @@ static void spawn(Unit *u) {
     if (pipe2(pipefd, O_CLOEXEC) != 0) {
         logmsg("%s: pipe: %s", u->name, strerror(errno));
     }
+    // Until exec_unit has restored the default handlers, a SIGTERM for the
+    // unit would run ggl-svcd's handler in the child: hold it back.
+    sigset_t stop_signals;
+    sigset_t old_mask;
+    (void) sigemptyset(&stop_signals);
+    (void) sigaddset(&stop_signals, SIGTERM);
+    (void) sigaddset(&stop_signals, SIGINT);
+    (void) sigprocmask(SIG_BLOCK, &stop_signals, &old_mask);
     pid_t pid = fork();
+    if (pid != 0) {
+        (void) sigprocmask(SIG_SETMASK, &old_mask, NULL);
+    }
     if (pid < 0) {
         logmsg("%s: fork: %s", u->name, strerror(errno));
         (void) close(pipefd[0]);
@@ -1074,8 +1135,8 @@ static void unit_exited(Unit *u, int status) {
         u->leftover_kill_at_ms = u->kill_at_ms;
         u->kill_at_ms = 0;
         kill_leftovers(u);
-        set_result(u, "success");
-        set_state(u, S_INACTIVE);
+        set_result(u, u->timed_out ? "timeout" : "success");
+        set_state(u, u->timed_out ? S_FAILED : S_INACTIVE);
         if (u->restart_after_stop) {
             u->restart_after_stop = false;
             request_start(u, true);
@@ -1105,7 +1166,12 @@ static void unit_exited(Unit *u, int status) {
     } else if (u->timed_out) {
         set_result(u, "timeout");
     } else {
-        set_result(u, WIFSIGNALED(status) ? "signal" : "exit-code");
+        set_result(
+            u,
+            !WIFSIGNALED(status)  ? "exit-code"
+                : WCOREDUMP(status) ? "core-dump"
+                                    : "signal"
+        );
     }
     kill_leftovers(u);
 
@@ -1152,7 +1218,9 @@ static void process_timers(void) {
             (void) signal_cgroup(u, SIGTERM);
         }
         if ((u->kill_at_ms != 0) && (now >= u->kill_at_ms) && (u->pid > 0)) {
+            // TimeoutStopSec: as systemd, a stop that needs SIGKILL fails.
             u->kill_at_ms = 0;
+            u->timed_out = true;
             (void) signal_cgroup(u, SIGKILL);
         }
         if ((u->leftover_kill_at_ms != 0) && (now >= u->leftover_kill_at_ms)) {
@@ -1197,7 +1265,9 @@ static bool valid_unit_name(const char *name) {
 
 // Copies a unit file into STATE_DIR/units: what runs is what was linked.
 static bool copy_unit_file(const char *src, const char *name) {
-    int in = open(src, O_RDONLY | O_CLOEXEC | O_NOFOLLOW);
+    // O_NONBLOCK: opening a FIFO must not block; only a regular file is
+    // accepted below.
+    int in = open(src, O_RDONLY | O_CLOEXEC | O_NOFOLLOW | O_NONBLOCK);
     if (in < 0) {
         return false;
     }
@@ -1305,14 +1375,13 @@ static void reset_failed(Unit *u) {
     }
 }
 
-// Equivalent of sd_notify READY=1 / RELOADING=1 / STOPPING=1 for a
-// Type=notify unit; other unit types ignore notifications, as under systemd.
+// Equivalent of sd_notify READY=1 / RELOADING=1 / STOPPING=1, once the
+// unit's NotifyAccess= admitted the sender. As under systemd, READY only
+// completes the start of a Type=notify unit; STOPPING applies to any unit.
 static void apply_notify(Unit *u, const char *what) {
-    if (u->type != T_NOTIFY) {
-        return;
-    }
     if ((strcmp(what, "READY") == 0) || (strcmp(what, "RELOADING") == 0)) {
-        if ((u->state == S_ACTIVATING) && (u->pid > 0) && !u->timed_out
+        if ((u->type == T_NOTIFY) && (u->state == S_ACTIVATING) && (u->pid > 0)
+            && !u->timed_out
             && (u->restart_at_ms == 0)) {
             u->start_deadline_ms = 0;
             set_state(u, S_ACTIVE);
