@@ -7,10 +7,14 @@
 #include <gg/log.h>
 #include <gg/map.h>
 #include <gg/object.h>
+#include <gg/utils.h>
 #include <gg/vector.h>
 #include <ggl/aws_iot_call.h>
 #include <stdbool.h>
 #include <stdint.h>
+
+#define CSR_REQUEST_ATTEMPTS 12
+#define CSR_REQUEST_RETRY_S 5
 
 #define MAX_TOKEN_SIZE 512
 #define MAX_TOPIC_LEN 256
@@ -191,9 +195,31 @@ GgError ggl_get_certificate_from_aws(
     static uint8_t token_mem[MAX_TOKEN_SIZE];
     GgBuffer token = GG_BUF(token_mem);
     GgBuffer iotcored = GG_STR("iotcoredfleet");
+    GgBuffer cert_pem_mem = *cert_pem_out;
 
-    GgError ret
-        = send_csr_request(csr_as_ggl_buffer, &token, iotcored, cert_pem_out);
+    // The caller waits a fixed time for iotcored to connect, which is not
+    // always enough (TLS on a slow core takes longer). Until it succeeds,
+    // the certificate request changes nothing in the cloud, so retry it
+    // while the connection comes up.
+    GgError ret = GG_ERR_FAILURE;
+    for (int attempt = 1; attempt <= CSR_REQUEST_ATTEMPTS; attempt++) {
+        token = GG_BUF(token_mem);
+        *cert_pem_out = cert_pem_mem;
+        ret = send_csr_request(
+            csr_as_ggl_buffer, &token, iotcored, cert_pem_out
+        );
+        if (ret == GG_ERR_OK) {
+            break;
+        }
+        if (attempt < CSR_REQUEST_ATTEMPTS) {
+            GG_LOGW(
+                "Certificate request failed (attempt %d of %d), retrying.",
+                attempt,
+                CSR_REQUEST_ATTEMPTS
+            );
+            (void) gg_sleep(CSR_REQUEST_RETRY_S);
+        }
+    }
     if (ret != GG_ERR_OK) {
         return ret;
     }
