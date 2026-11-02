@@ -72,6 +72,9 @@
 #ifndef STATE_DIR
 #define STATE_DIR "/var/lib/ggl-svc"
 #endif
+#ifndef GGL_SVC_LOG_PATH
+#define GGL_SVC_LOG_PATH "/dev/log"
+#endif
 #ifndef CGROUP_ROOT
 #define CGROUP_ROOT "/sys/fs/cgroup"
 #endif
@@ -79,6 +82,12 @@
 #define CGROUP2_MAGIC 0x63677270
 #define LOG_LINE_MAX 480
 #define LOG_DRAIN_MAX 4096
+// Per unit, as journald's RateLimitIntervalSec/RateLimitBurst (with a
+// smaller burst: the log is a few hundred kB of RAM here).
+#define LOG_RATE_INTERVAL_MS 30000
+#define LOG_RATE_BURST 1000
+// Time per main loop pass that logging may wait for syslogd.
+#define LOG_WAIT_BUDGET_MS 100
 #define UNIT_FILE_MAX 8192
 
 #define MAX_UNITS 128
@@ -147,6 +156,7 @@ typedef struct {
     RestartPolicy restart;
     unsigned restart_sec;
     bool remain;
+    bool ignore_sigpipe;
     int success_status[4];
     int n_success;
     unsigned start_limit_interval_s;
@@ -181,6 +191,11 @@ typedef struct {
     int log_fd;
     char log_buf[LOG_LINE_MAX + 1];
     size_t log_len;
+    char log_held[512]; // output read but not yet logged: syslogd is behind
+    size_t log_held_len;
+    uint64_t log_window_ms;
+    unsigned log_lines;
+    unsigned long log_suppressed;
 } Unit;
 
 static Unit units[MAX_UNITS];
@@ -207,10 +222,142 @@ static bool restarting;
 
 static volatile sig_atomic_t terminate;
 
-static void logmsg(const char *fmt, ...) {
+// Logging //
+
+// Messages go to syslogd's /dev/log on a non-blocking socket. musl's
+// syslog() blocks once syslogd falls behind (the socket queue holds 10
+// messages), and a unit writing fast enough would then stall the service
+// manager and every IPC authentication waiting on it. Instead, logging
+// waits for syslogd at most LOG_WAIT_BUDGET_MS per main loop pass, which
+// lets syslogd run. Beyond that, a unit's output is held back (see
+// drain_log) until syslogd catches up; only ggl-svcd's own messages are
+// dropped, counted, and the count logged once syslogd keeps up again.
+typedef enum {
+    LOG_SENT,
+    LOG_BUSY, // syslogd is behind: try again later
+    LOG_LOST // no syslogd
+} LogSend;
+
+static int log_sock = -1;
+static unsigned long log_dropped;
+static uint64_t log_wait_until_ms;
+
+static uint64_t now_ms(void);
+
+static void log_connect(void) {
+    log_sock = socket(AF_UNIX, SOCK_DGRAM | SOCK_CLOEXEC | SOCK_NONBLOCK, 0);
+    if (log_sock < 0) {
+        return;
+    }
+    struct sockaddr_un addr = { .sun_family = AF_UNIX };
+    (void) snprintf(addr.sun_path, sizeof(addr.sun_path), GGL_SVC_LOG_PATH);
+    if (connect(log_sock, (struct sockaddr *) &addr, sizeof(addr)) != 0) {
+        (void) close(log_sock);
+        log_sock = -1;
+    }
+}
+
+static LogSend log_send(const char *msg, size_t len) {
+    int reconnects = 0;
+    for (;;) {
+        if (log_sock < 0) {
+            log_connect();
+            if (log_sock < 0) {
+                return LOG_LOST;
+            }
+        }
+        if (send(log_sock, msg, len, MSG_NOSIGNAL) == (ssize_t) len) {
+            return LOG_SENT;
+        }
+        if ((errno == EAGAIN) || (errno == EWOULDBLOCK) || (errno == ENOBUFS)) {
+            uint64_t now = now_ms();
+            if (now >= log_wait_until_ms) {
+                return LOG_BUSY;
+            }
+            struct pollfd p = { .fd = log_sock, .events = POLLOUT };
+            (void) poll(&p, 1, (int) (log_wait_until_ms - now));
+            continue;
+        }
+        // syslogd was restarted: connect again.
+        (void) close(log_sock);
+        log_sock = -1;
+        if (++reconnects > 1) {
+            return LOG_LOST;
+        }
+    }
+}
+
+// One syslog message, formatted as musl's syslog() does.
+__attribute__((format(printf, 2, 0))) static LogSend log_format_send(
+    int priority, const char *fmt, va_list ap
+) {
+    char buf[LOG_LINE_MAX + NAME_LEN + 64];
+    char stamp[32];
+    struct tm tm;
+    time_t now = time(NULL);
+    (void) strftime(stamp, sizeof(stamp), "%b %e %T", localtime_r(&now, &tm));
+    int head = snprintf(
+        buf, sizeof(buf), "<%d>%s ggl-svcd: ", LOG_DAEMON | priority, stamp
+    );
+    if ((head < 0) || ((size_t) head >= sizeof(buf))) {
+        return LOG_LOST;
+    }
+    int body = vsnprintf(buf + head, sizeof(buf) - (size_t) head, fmt, ap);
+    size_t len = (size_t) head;
+    if (body > 0) {
+        len += ((size_t) body < sizeof(buf) - (size_t) head)
+            ? (size_t) body
+            : sizeof(buf) - (size_t) head - 1;
+    }
+    return log_send(buf, len);
+}
+
+__attribute__((format(printf, 2, 3))) static LogSend log_try(
+    int priority, const char *fmt, ...
+) {
     va_list ap;
     va_start(ap, fmt);
-    vsyslog(LOG_NOTICE, fmt, ap);
+    LogSend sent = log_format_send(priority, fmt, ap);
+    va_end(ap);
+    return sent;
+}
+
+static void report_dropped(void) {
+    if ((log_dropped > 0)
+        && (log_try(
+                LOG_WARNING,
+                "%lu log lines dropped: syslogd did not keep up",
+                log_dropped
+            )
+            == LOG_SENT)) {
+        log_dropped = 0;
+    }
+}
+
+__attribute__((format(printf, 2, 0))) static void vlog_line(
+    int priority, const char *fmt, va_list ap
+) {
+    report_dropped();
+    if (log_format_send(priority, fmt, ap) != LOG_SENT) {
+        log_dropped++;
+    }
+}
+
+__attribute__((format(printf, 2, 3))) static void log_line(
+    int priority, const char *fmt, ...
+) {
+    va_list ap;
+    va_start(ap, fmt);
+    vlog_line(priority, fmt, ap);
+    va_end(ap);
+}
+
+__attribute__((format(printf, 1, 2))) static void logmsg(
+    const char *fmt, ...
+) {
+    va_list ap;
+    va_start(ap, fmt);
+    vlog_line(LOG_NOTICE, fmt, ap);
     va_end(ap);
 }
 
@@ -313,14 +460,23 @@ static Unit *unit_of_pid(pid_t pid) {
     }
     char line[NAME_LEN + 64];
     Unit *u = NULL;
+    bool line_start = true;
     while (fgets(line, sizeof(line), f) != NULL) {
+        // Only a complete line counts: the rest of a line longer than the
+        // buffer (a deep cgroup path) must not be read as a line of its own.
+        bool starts_line = line_start;
+        char *end = strchr(line, '\n');
+        line_start = (end != NULL);
+        if (!starts_line || (end == NULL)) {
+            continue;
+        }
+        *end = '\0';
         // cgroup v2: "0::/ggl-svc/<unit>"
         static const char prefix[] = "0::/ggl-svc/";
         if (strncmp(line, prefix, sizeof(prefix) - 1) != 0) {
             continue;
         }
         char *name = line + sizeof(prefix) - 1;
-        name[strcspn(name, "\n")] = '\0';
         if (strchr(name, '/') == NULL) {
             u = find_unit(name);
         }
@@ -429,6 +585,7 @@ static void reset_config(Unit *u) {
     u->restart = R_NO;
     u->restart_sec = 1;
     u->remain = false;
+    u->ignore_sigpipe = true;
     u->n_success = 0;
     u->start_limit_interval_s = DEFAULT_START_LIMIT_INTERVAL_S;
     u->start_limit_burst = DEFAULT_START_LIMIT_BURST;
@@ -440,6 +597,13 @@ static void reset_config(Unit *u) {
     u->ready_socket[0] = '\0';
 }
 
+// Copies a unit setting; false if it does not fit, so that a value is never
+// cut short.
+static bool set_value(char *dst, size_t size, const char *val) {
+    int n = snprintf(dst, size, "%s", val);
+    return (n >= 0) && ((size_t) n < size);
+}
+
 static bool parse_unit(Unit *u) {
     FILE *f = fopen(u->path, "re");
     if (f == NULL) {
@@ -448,8 +612,19 @@ static bool parse_unit(Unit *u) {
     }
     reset_config(u);
     bool start_timeout_set = false;
-    char line[768];
-    while (fgets(line, sizeof(line), f) != NULL) {
+    bool valid = true;
+    // A linked unit file is at most UNIT_FILE_MAX bytes (copy_unit_file),
+    // so any of its lines fits.
+    static char line[UNIT_FILE_MAX + 2];
+    while (valid && (fgets(line, sizeof(line), f) != NULL)) {
+        size_t len = strlen(line);
+        if (((len == 0) || (line[len - 1] != '\n')) && !feof(f)) {
+            // Never parse the rest of a line as a line of its own: it could
+            // carry a setting that the line's author did not write.
+            logmsg("%s: line too long", u->name);
+            valid = false;
+            break;
+        }
         char *l = trim(line);
         if ((*l == '#') || (*l == ';') || (*l == '[') || (*l == '\0')) {
             continue;
@@ -475,22 +650,22 @@ static bool parse_unit(Unit *u) {
                 : (strcmp(val, "main") == 0)             ? N_MAIN
                                                          : N_NONE;
         } else if (strcmp(key, "ExecStart") == 0) {
-            (void) snprintf(u->exec, sizeof(u->exec), "%s", val);
+            valid = set_value(u->exec, sizeof(u->exec), val);
         } else if (strcmp(key, "User") == 0) {
-            (void) snprintf(u->user, sizeof(u->user), "%s", val);
+            valid = set_value(u->user, sizeof(u->user), val);
         } else if (strcmp(key, "Group") == 0) {
-            (void) snprintf(u->group, sizeof(u->group), "%s", val);
+            valid = set_value(u->group, sizeof(u->group), val);
         } else if (strcmp(key, "WorkingDirectory") == 0) {
-            (void) snprintf(u->workdir, sizeof(u->workdir), "%s", val);
+            valid = set_value(u->workdir, sizeof(u->workdir), val);
         } else if (strcmp(key, "Environment") == 0) {
-            if (u->n_env < MAX_ENV) {
-                size_t n = strlen(val);
-                if ((n >= 2) && (val[0] == '"') && (val[n - 1] == '"')) {
-                    val[n - 1] = '\0';
-                    val++;
-                }
-                (void) snprintf(u->env[u->n_env++], 256, "%s", val);
+            size_t n = strlen(val);
+            if ((n >= 2) && (val[0] == '"') && (val[n - 1] == '"')) {
+                val[n - 1] = '\0';
+                val++;
             }
+            valid = (u->n_env < MAX_ENV)
+                && set_value(u->env[u->n_env], sizeof(u->env[0]), val);
+            u->n_env += valid ? 1 : 0;
         } else if (strcmp(key, "Restart") == 0) {
             u->restart = (strcmp(val, "always") == 0) ? R_ALWAYS
                 : (strcmp(val, "on-failure") == 0)    ? R_ON_FAILURE
@@ -499,6 +674,9 @@ static bool parse_unit(Unit *u) {
             u->restart_sec = (unsigned) strtoul(val, NULL, 10);
         } else if (strcmp(key, "RemainAfterExit") == 0) {
             u->remain = (strcmp(val, "true") == 0) || (strcmp(val, "yes") == 0);
+        } else if (strcmp(key, "IgnoreSIGPIPE") == 0) {
+            u->ignore_sigpipe = !((strcmp(val, "false") == 0)
+                                  || (strcmp(val, "no") == 0));
         } else if (strcmp(key, "SuccessExitStatus") == 0) {
             char *save = NULL;
             for (char *tok = strtok_r(val, " ", &save);
@@ -531,12 +709,22 @@ static bool parse_unit(Unit *u) {
             add_deps(u->wants, &u->n_wants, val);
             add_deps(u->binds, &u->n_binds, val);
         } else if (strcmp(key, "X-GGL-ReadySocket") == 0) {
-            (void) snprintf(
-                u->ready_socket, sizeof(u->ready_socket), "%s", val
-            );
+            // Only the core units' readiness comes from a socket; root
+            // removes the path at every start.
+            if (u->core) {
+                valid = set_value(
+                    u->ready_socket, sizeof(u->ready_socket), val
+                );
+            }
+        }
+        if (!valid) {
+            logmsg("%s: %s= too long, or too many", u->name, key);
         }
     }
     (void) fclose(f);
+    if (!valid) {
+        return false;
+    }
     if ((u->type == T_ONESHOT) && !start_timeout_set) {
         // As systemd: no start timeout for oneshot services by default.
         u->start_timeout_s = 0;
@@ -653,6 +841,11 @@ static void load_linked_units(void) {
             }
             continue;
         }
+        Unit *existing = find_unit(e->d_name);
+        if ((existing != NULL) && existing->core) {
+            logmsg("%s: a core unit, not loaded from its link", e->d_name);
+            continue;
+        }
         char copy[PATH_LEN + NAME_LEN];
         (void) snprintf(copy, sizeof(copy), STATE_DIR "/units/%s", e->d_name);
         if (access(copy, F_OK) != 0) {
@@ -762,9 +955,14 @@ static void build_env(
 // Runs in the child, with SIGTERM and SIGINT blocked; never returns.
 static void exec_unit(const Unit *u, int log_fd) {
     // ggl-svcd's own handlers must not catch a stop meant for the unit:
-    // restore the defaults before anything can unblock them.
-    (void) signal(SIGTERM, SIG_DFL);
-    (void) signal(SIGINT, SIG_DFL);
+    // restore the defaults before anything can unblock them. As systemd,
+    // reset every signal: ggl-svcd may have inherited some as ignored
+    // (SIGQUIT, from a shell's background job).
+    for (int sig = 1; sig < NSIG; sig++) {
+        if ((sig != SIGKILL) && (sig != SIGSTOP)) {
+            (void) signal(sig, SIG_DFL);
+        }
+    }
     // Join the unit's cgroup before anything else runs (exit status 219 is
     // systemd's EXIT_CGROUP).
     char procs[NAME_LEN + 64];
@@ -776,7 +974,12 @@ static void exec_unit(const Unit *u, int log_fd) {
     sigset_t none;
     (void) sigemptyset(&none);
     (void) sigprocmask(SIG_SETMASK, &none, NULL);
-    (void) signal(SIGPIPE, SIG_DFL);
+    if (u->ignore_sigpipe) {
+        // IgnoreSIGPIPE=, true by default under systemd.
+        (void) signal(SIGPIPE, SIG_IGN);
+    }
+    // ggl-svcd itself is exempt from the OOM killer; its units are not.
+    (void) write_file("/proc/self/oom_score_adj", "0");
 
     int devnull = open("/dev/null", O_RDONLY);
     if (devnull >= 0) {
@@ -787,12 +990,6 @@ static void exec_unit(const Unit *u, int log_fd) {
         (void) dup2(log_fd, STDOUT_FILENO);
         (void) dup2(log_fd, STDERR_FILENO);
         (void) close(log_fd);
-    }
-
-    const char *dir = (u->workdir[0] != '\0') ? u->workdir : "/";
-    if (chdir(dir) != 0) {
-        (void) fprintf(stderr, "chdir %s: %s\n", dir, strerror(errno));
-        _exit(200);
     }
 
     if ((u->user[0] != '\0') || (u->group[0] != '\0')) {
@@ -817,6 +1014,14 @@ static void exec_unit(const Unit *u, int log_fd) {
         }
     }
 
+    // As systemd: enter the working directory as the unit's user, so that
+    // the unit cannot reach one its user could not.
+    const char *dir = (u->workdir[0] != '\0') ? u->workdir : "/";
+    if (chdir(dir) != 0) {
+        (void) fprintf(stderr, "chdir %s: %s\n", dir, strerror(errno));
+        _exit(200);
+    }
+
     static char storage[MAX_ENV + 8][320];
     char *envp[MAX_ENV + 8];
     build_env(u, envp, storage, MAX_ENV + 8);
@@ -833,8 +1038,12 @@ static void exec_unit(const Unit *u, int log_fd) {
 }
 
 // Unit output: forward complete lines to syslog, tagged with the unit name
-// without its ggl. prefix and .service suffix.
-static void emit_line(Unit *u) {
+// without its ggl. prefix and .service suffix. False if syslogd is behind:
+// the line is kept, to be sent again.
+static bool emit_line(Unit *u) {
+    if (u->log_len == 0) {
+        return true;
+    }
     char tag[NAME_LEN];
     (void) snprintf(tag, sizeof(tag), "%s", u->name);
     size_t n = strlen(tag);
@@ -843,34 +1052,89 @@ static void emit_line(Unit *u) {
     }
     const char *t = (strncmp(tag, "ggl.", 4) == 0) ? tag + 4 : tag;
     u->log_buf[u->log_len] = '\0';
-    if (u->log_len > 0) {
-        syslog(LOG_INFO, "%s: %s", t, u->log_buf);
+    uint64_t now = now_ms();
+    if ((now - u->log_window_ms) >= LOG_RATE_INTERVAL_MS) {
+        if (u->log_suppressed > 0) {
+            log_line(
+                LOG_WARNING,
+                "%s: suppressed %lu lines (more than %d in %d s)",
+                t,
+                u->log_suppressed,
+                LOG_RATE_BURST,
+                LOG_RATE_INTERVAL_MS / 1000
+            );
+        }
+        u->log_window_ms = now;
+        u->log_lines = 0;
+        u->log_suppressed = 0;
+    }
+    if (u->log_lines >= LOG_RATE_BURST) {
+        u->log_suppressed++;
+    } else {
+        report_dropped();
+        LogSend sent = log_try(LOG_INFO, "%s: %s", t, u->log_buf);
+        if (sent == LOG_BUSY) {
+            return false;
+        }
+        if (sent == LOG_LOST) {
+            log_dropped++;
+        }
+        u->log_lines++;
     }
     u->log_len = 0;
+    return true;
+}
+
+// Splits output into lines; returns how much of it was consumed, less than
+// len if syslogd fell behind.
+static size_t feed_log(Unit *u, const char *data, size_t len) {
+    for (size_t i = 0; i < len; i++) {
+        if (data[i] == '\n') {
+            if (!emit_line(u)) {
+                return i;
+            }
+            continue;
+        }
+        if ((u->log_len == LOG_LINE_MAX) && !emit_line(u)) {
+            return i;
+        }
+        u->log_buf[u->log_len++] = data[i];
+    }
+    return len;
 }
 
 // Reads at most LOG_DRAIN_MAX bytes per call so that a unit writing
-// continuously cannot keep the main loop here.
+// continuously cannot keep the main loop here. While syslogd is behind,
+// the unit's output stays in its pipe: a unit writing faster than syslogd
+// can log is slowed down, as under journald, and nothing is lost.
 static void drain_log(Unit *u) {
-    char chunk[512];
+    if (u->log_held_len > 0) {
+        size_t used = feed_log(u, u->log_held, u->log_held_len);
+        u->log_held_len -= used;
+        memmove(u->log_held, u->log_held + used, u->log_held_len);
+        if (u->log_held_len > 0) {
+            return;
+        }
+    }
+    char chunk[sizeof(u->log_held)];
     ssize_t n = 0;
     size_t total = 0;
     while ((total < LOG_DRAIN_MAX)
            && ((n = read(u->log_fd, chunk, sizeof(chunk))) > 0)) {
         total += (size_t) n;
-        for (ssize_t i = 0; i < n; i++) {
-            if (chunk[i] == '\n') {
-                emit_line(u);
-            } else if (u->log_len == LOG_LINE_MAX) {
-                emit_line(u);
-                u->log_buf[u->log_len++] = chunk[i];
-            } else {
-                u->log_buf[u->log_len++] = chunk[i];
-            }
+        size_t used = feed_log(u, chunk, (size_t) n);
+        if (used < (size_t) n) {
+            u->log_held_len = (size_t) n - used;
+            memcpy(u->log_held, chunk + used, u->log_held_len);
+            return;
         }
     }
     if ((n == 0) || ((n < 0) && (errno != EAGAIN) && (errno != EINTR))) {
-        emit_line(u);
+        // The unit closed its output; a last line may lack its newline.
+        if (!emit_line(u)) {
+            log_dropped++;
+            u->log_len = 0;
+        }
         (void) close(u->log_fd);
         u->log_fd = -1;
     }
@@ -919,7 +1183,9 @@ static void spawn(Unit *u) {
         set_state(u, S_FAILED);
         return;
     }
-    if (u->ready_socket[0] != '\0') {
+    struct stat st;
+    if ((u->ready_socket[0] != '\0') && (lstat(u->ready_socket, &st) == 0)
+        && S_ISSOCK(st.st_mode)) {
         // A socket left by a previous instance must not count as ready.
         (void) unlink(u->ready_socket);
     }
@@ -942,6 +1208,12 @@ static void spawn(Unit *u) {
             u->log_fd = -1;
         }
     }
+    if (u->log_held_len > 0) {
+        // syslogd is still behind with it.
+        log_dropped++;
+        u->log_held_len = 0;
+    }
+    u->log_len = 0;
     int pipefd[2] = { -1, -1 };
     if (pipe2(pipefd, O_CLOEXEC) != 0) {
         logmsg("%s: pipe: %s", u->name, strerror(errno));
@@ -1242,7 +1514,9 @@ static void process_timers(void) {
 
 // Control protocol //
 
-static void reply(int fd, const char *fmt, ...) {
+__attribute__((format(printf, 2, 3))) static void reply(
+    int fd, const char *fmt, ...
+) {
     char buf[1024];
     va_list ap;
     va_start(ap, fmt);
@@ -1705,7 +1979,11 @@ static bool setup_cgroups(void) {
 }
 
 int main(void) {
-    openlog("ggl-svcd", LOG_NDELAY, LOG_DAEMON);
+    log_connect();
+    log_wait_until_ms = now_ms() + LOG_WAIT_BUDGET_MS;
+    // As PID 1 under systemd: the OOM killer picks a unit, never the
+    // service manager (exec_unit resets this for the units).
+    (void) write_file("/proc/self/oom_score_adj", "-1000");
     (void) signal(SIGPIPE, SIG_IGN);
     struct sigaction sa = { .sa_handler = on_signal };
     (void) sigaction(SIGTERM, &sa, NULL);
@@ -1743,13 +2021,14 @@ int main(void) {
     logmsg("managing %d units", n_units);
 
     while (!terminate) {
+        log_wait_until_ms = now_ms() + LOG_WAIT_BUDGET_MS;
         reap_children();
         process_timers();
         process_pending();
         expire_pending();
 
-        struct pollfd pfds[1 + MAX_PENDING + MAX_UNITS];
-        Unit *owners[1 + MAX_PENDING + MAX_UNITS];
+        struct pollfd pfds[2 + MAX_PENDING + MAX_UNITS];
+        Unit *owners[2 + MAX_PENDING + MAX_UNITS];
         nfds_t nfds = 0;
         pfds[nfds]
             = (struct pollfd) { .fd = (n_pending < MAX_PENDING) ? listener : -1,
@@ -1762,22 +2041,28 @@ int main(void) {
             owners[nfds++] = NULL;
         }
         nfds_t first_log = nfds;
+        bool log_held = false;
         for (int i = 0; i < n_units; i++) {
-            if (units[i].log_fd >= 0) {
+            if (units[i].log_held_len > 0) {
+                // Its output waits for syslogd, not for the unit.
+                log_held = true;
+            } else if (units[i].log_fd >= 0) {
                 pfds[nfds] = (struct pollfd) { .fd = units[i].log_fd,
                                                .events = POLLIN };
                 owners[nfds++] = &units[i];
             }
         }
+        nfds_t n_log = nfds;
+        if (log_held && (log_sock >= 0)) {
+            pfds[nfds] = (struct pollfd) { .fd = log_sock, .events = POLLOUT };
+            owners[nfds++] = NULL;
+        }
         int ret = poll(pfds, nfds, 250);
-        if (ret <= 0) {
+        if (ret < 0) {
             continue;
         }
-        for (nfds_t i = first_log; i < nfds; i++) {
-            if (pfds[i].revents & (POLLIN | POLLHUP | POLLERR)) {
-                drain_log(owners[i]);
-            }
-        }
+        log_wait_until_ms = now_ms() + LOG_WAIT_BUDGET_MS;
+        // Requests first, so that unit output cannot delay them.
         // Serve in reverse: drop_pending() moves the last entry into the
         // served slot, which has then already been handled.
         for (nfds_t i = first_log; i > first_pending; i--) {
@@ -1788,6 +2073,20 @@ int main(void) {
         }
         if (pfds[0].revents & POLLIN) {
             accept_clients(listener);
+        }
+        for (int i = 0; i < n_units; i++) {
+            if (units[i].log_held_len > 0) {
+                drain_log(&units[i]);
+            }
+        }
+        // A request may have removed or moved units (daemon-reload): drain
+        // only entries that still own the descriptor polled.
+        for (nfds_t i = first_log; i < n_log; i++) {
+            if ((pfds[i].revents & (POLLIN | POLLHUP | POLLERR))
+                && ((owners[i] - units) < n_units)
+                && (owners[i]->log_fd == pfds[i].fd)) {
+                drain_log(owners[i]);
+            }
         }
     }
 

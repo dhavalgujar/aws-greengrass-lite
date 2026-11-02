@@ -20,7 +20,7 @@
 GgError ggl_ipc_auth_validate_name(pid_t pid, GgBuffer component_name) {
 #ifdef GGL_PORTABLE_CORE
     // Without systemd, ggl-svcd knows which unit a process belongs to: the
-    // unit whose main process is the peer or one of its ancestors.
+    // unit whose cgroup it is in, as sd_pid_get_unit() reads it.
     char request[32];
     char unit_name[256];
     (void) snprintf(request, sizeof(request), "whois %ld", (long) pid);
