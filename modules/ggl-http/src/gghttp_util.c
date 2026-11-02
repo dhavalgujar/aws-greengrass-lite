@@ -50,6 +50,7 @@ static GgError translate_curl_code(CURLcode code) {
     switch (code) {
     case CURLE_OK:
         return GG_ERR_OK;
+    case CURLE_COULDNT_RESOLVE_HOST:
     case CURLE_COULDNT_CONNECT:
     case CURLE_NO_CONNECTION_AVAILABLE:
     case CURLE_RECV_ERROR:
@@ -79,6 +80,9 @@ static bool can_retry(CURLcode code, CurlData *data) {
         break;
 
     case CURLE_OPERATION_TIMEDOUT:
+    // A name server that does not answer in time (musl gives up after
+    // 5 s) is as transient as a connection that fails.
+    case CURLE_COULDNT_RESOLVE_HOST:
     case CURLE_COULDNT_CONNECT:
     case CURLE_SSL_CONNECT_ERROR:
     case CURLE_GOT_NOTHING:
